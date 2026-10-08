@@ -2,7 +2,7 @@
 
 Cloud sync backend for the KangPaket desktop app. Go + MySQL.
 
-Phase 1: config, `/healthz`, auto-migrations, Docker. Phase 2: authentication. Phase 3: Sync API (this state).
+Phase 1: config, `/healthz`, auto-migrations, Docker. Phase 2: authentication. Phase 3: Sync API. Phase 4: hardening + deploy (this state).
 
 ## Run
 
@@ -11,6 +11,9 @@ cp .env.example .env   # fill DB_PASSWORD and JWT_SECRET
 docker compose up -d --build
 curl localhost:8095/healthz   # {"status":"ok"}
 ```
+
+On the homelab Mac Mini `docker compose build` can hang on `docker-credential-desktop`; use
+`DOCKER_CONFIG=/tmp/dockercfg` (a dir with `config.json` = `{}` and a `cli-plugins` symlink to `~/.docker/cli-plugins`).
 
 The compose project is `kangpaket-server`; the DB host must be reachable on the
 `kangpaket-server_default` network (the homelab attaches `consolidated-mysql` to it).
@@ -22,16 +25,17 @@ Local without Docker: `go run ./cmd/server` with the env vars below exported.
 | Var | Default | Notes |
 |---|---|---|
 | `PORT` | `8080` | container listen port (host port: `HTTP_PORT`, default 8095) |
+| `BIND_ADDR` | `127.0.0.1` | compose only: host interface for the published port |
 | `DB_HOST` / `DB_PORT` | `127.0.0.1` / `3306` | compose sets `consolidated-mysql` |
 | `DB_NAME` / `DB_USER` | `kangpaket` | |
 | `DB_PASSWORD` | required | |
-| `JWT_SECRET` | required, >= 32 chars | server refuses to start otherwise |
+| `JWT_SECRET` | required, >= 32 chars | server refuses to start if empty, short or still `change-me...` |
 | `REGISTRATION_ENABLED` | `false` | `true` opens `POST /auth/register` |
 | `ACCESS_TOKEN_TTL` | `15m` | JWT lifetime |
 | `REFRESH_TOKEN_TTL` | `720h` | refresh token lifetime (30 days) |
-| `TRUST_PROXY_HEADERS` | `false` | trust `CF-Connecting-IP` for rate limiting; enable only behind Cloudflare Tunnel |
+| `TRUST_PROXY_HEADERS` | `false` | use `CF-Connecting-IP` (valid IP only) as client IP for rate limiting; see Deployment |
 | `CORS_ALLOWED_ORIGINS` | empty | comma-separated; empty = CORS off |
-| `RATE_LIMIT_PER_MIN` / `RATE_LIMIT_USER_PER_MIN` | `5` / `5` | attempts per minute per IP / per username (login) |
+| `RATE_LIMIT_PER_MIN` / `RATE_LIMIT_USER_PER_MIN` | `5` / `5` | attempts per minute per IP / per IP+username (login); a per-username ceiling across all IPs is 10x the latter |
 
 ## Auth
 
@@ -139,6 +143,48 @@ then `push` every local record that is newer than, or missing from, the server c
 `conflict` results by adopting `server`; then `pull` again from the stored cursor and save the
 returned `cursor`. Afterwards sync = `push` local changes (with deletes as tombstones, batches of
 <= 500) then `pull` from the stored cursor. Refresh the access token (15 min) on 401.
+
+## Deployment (homelab)
+
+- **Port binding**: compose publishes `127.0.0.1:8095` only. The Cloudflare tunnel runs on the same
+  host, so loopback is enough, and LAN clients cannot reach the API directly. Override with
+  `BIND_ADDR` only if you really need it.
+- **Tunnel**: `~/.cloudflared/config.yml` maps `kangpaket-api.quezacolt.my.id` to
+  `http://localhost:8095` (DNS: `cloudflared tunnel route dns mac-mini kangpaket-api.quezacolt.my.id`).
+  Reload cloudflared (brief outage of every tunnel hostname):
+  `sudo launchctl unload /Library/LaunchDaemons/com.cloudflare.cloudflared.plist` then
+  `sudo launchctl load /Library/LaunchDaemons/com.cloudflare.cloudflared.plist`
+  (`kickstart -k` is known to fail here).
+- **`TRUST_PROXY_HEADERS`**: set `true` only when ALL traffic arrives through the tunnel and the
+  port is bound to loopback (as above). Then `CF-Connecting-IP` is the client IP for rate limiting.
+  If the port is reachable by other hosts, any client can send a forged header and bypass the
+  limits, so keep it `false`. Only `CF-Connecting-IP` is read (never `X-Forwarded-For`), and only
+  a literal IP is accepted; anything else falls back to the socket address.
+- **Backup**: the database `kangpaket` lives in `consolidated-mysql`, which the daily
+  `~/work-agent/scripts/backup-databases.sh` dumps with `--all-databases` (so it is included
+  without any per-database config) and rsyncs to HPMINI (`/home/wawan/backups/macmini-db/<date>/`,
+  30 days). Restore only this database from such a dump:
+  `gunzip -c consolidated-mysql_<date>.sql.gz | docker exec -i consolidated-mysql sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" --one-database kangpaket'`
+  (the dump contains `USE kangpaket`; `--one-database` skips statements for other databases).
+
+## Security notes
+
+- All SQL is parameterised; table names come from a fixed map. Every sync query is keyed by `user_id`.
+- JWT: HS256 only (algorithm pinned), issuer + `exp` required, user re-checked in the DB on each
+  request (disabled/deleted users lose access immediately). Access tokens stay valid until they
+  expire (15 min) after logout.
+- Refresh tokens: random, stored as sha256, rotated on use, reuse revokes the whole family.
+- Login spends one argon2id verification whether or not the user exists; same 401 either way.
+- Rate limiting is in memory (reset on restart) and cleaned every minute. Login uses three limiters:
+  per IP, per IP+username (so a third party cannot lock your username out from their own IP), and a
+  per-username ceiling across all IPs (10x). Tradeoff: a botnet of >= 10 IPs can still force
+  429s on one username for a minute; stronger protection needs persistent lockout or CAPTCHA.
+- Responses carry `nosniff`, `X-Frame-Options`, `no-store`, a locked-down CSP. HTTP server has
+  header/read/write/idle timeouts, 64 KiB header limit, per-endpoint body limits, graceful shutdown.
+- Logs never contain passwords, tokens or payloads (usernames only as a short hash on failed login).
+- The image is alpine, runs as uid 10001, has a `/healthz` HEALTHCHECK; secrets come from `.env` at
+  run time and are not in the image (`.dockerignore`) or git.
+- CLI: passwords only via stdin/TTY; errors go to stderr as `error: ...` with exit code 1.
 
 ## Migrations
 
