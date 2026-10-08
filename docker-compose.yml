@@ -5,7 +5,10 @@ services:
     build: .
     restart: unless-stopped
     ports:
-      - "${HTTP_PORT:-8095}:8080"
+      # Loopback only: cloudflared runs on this host, so nothing else needs the
+      # port. Keeps LAN clients from reaching the API directly and spoofing
+      # CF-Connecting-IP (TRUST_PROXY_HEADERS=true) to dodge rate limits.
+      - "${BIND_ADDR:-127.0.0.1}:${HTTP_PORT:-8095}:8080"
     environment:
       PORT: 8080
       # DB lives in the shared consolidated-mysql container, which is attached
