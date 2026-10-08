@@ -8,13 +8,27 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/wantox86/KangPaket-server/internal/auth"
 )
 
 type Pinger interface {
 	PingContext(ctx context.Context) error
 }
 
-func NewRouter(db Pinger, log *slog.Logger) http.Handler {
+type Options struct {
+	DB                  Pinger
+	Log                 *slog.Logger
+	Auth                *auth.Service
+	RegistrationEnabled bool
+	TrustProxyHeaders   bool
+	CORSAllowedOrigins  []string
+	RateLimitPerMin     int
+	RateLimitUserPerMin int
+}
+
+func NewRouter(o Options) http.Handler {
+	db, log := o.DB, o.Log
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
@@ -26,7 +40,10 @@ func NewRouter(db Pinger, log *slog.Logger) http.Handler {
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
-	return logRequests(mux, log)
+	if o.Auth != nil {
+		newAuthHandler(o).routes(mux)
+	}
+	return securityHeaders(cors(o.CORSAllowedOrigins, logRequests(mux, log)))
 }
 
 var _ Pinger = (*sql.DB)(nil)

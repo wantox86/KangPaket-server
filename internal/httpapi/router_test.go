@@ -21,7 +21,7 @@ func TestHealthz(t *testing.T) {
 		code int
 	}{{nil, 200}, {errors.New("down"), http.StatusServiceUnavailable}} {
 		rec := httptest.NewRecorder()
-		NewRouter(fakeDB{tc.err}, log).ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
+		NewRouter(Options{DB: fakeDB{tc.err}, Log: log}).ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
 		if rec.Code != tc.code {
 			t.Fatalf("got %d want %d", rec.Code, tc.code)
 		}
