@@ -1,0 +1,36 @@
+name: kangpaket-server
+
+services:
+  kangpaket-api:
+    build: .
+    restart: unless-stopped
+    ports:
+      # Loopback only: cloudflared runs on this host, so nothing else needs the
+      # port. Keeps LAN clients from reaching the API directly and spoofing
+      # CF-Connecting-IP (TRUST_PROXY_HEADERS=true) to dodge rate limits.
+      - "${BIND_ADDR:-127.0.0.1}:${HTTP_PORT:-8095}:8080"
+    environment:
+      PORT: 8080
+      # DB lives in the shared consolidated-mysql container, which is attached
+      # to this project's default network (kangpaket-server_default).
+      DB_HOST: ${DB_HOST:-consolidated-mysql}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_NAME: ${DB_NAME:-kangpaket}
+      DB_USER: ${DB_USER:-kangpaket}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      REGISTRATION_ENABLED: ${REGISTRATION_ENABLED:-false}
+      ACCESS_TOKEN_TTL: ${ACCESS_TOKEN_TTL:-15m}
+      REFRESH_TOKEN_TTL: ${REFRESH_TOKEN_TTL:-720h}
+      TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-false}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+      RATE_LIMIT_PER_MIN: ${RATE_LIMIT_PER_MIN:-5}
+      RATE_LIMIT_USER_PER_MIN: ${RATE_LIMIT_USER_PER_MIN:-5}
+    # argon2id uses 32MiB per in-flight hash (max 2 concurrent).
+    mem_limit: 128m
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "2"
