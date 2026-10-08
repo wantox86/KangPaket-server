@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -240,5 +241,61 @@ func TestSecurityHeadersAndCORS(t *testing.T) {
 	}
 	if rec := e.do("GET", "/healthz", "", "Origin", "https://evil.example"); rec.Header().Get("Access-Control-Allow-Origin") != "" {
 		t.Fatal("disallowed origin echoed")
+	}
+}
+
+func TestLockoutScopedToAttackerIP(t *testing.T) {
+	e := newEnv(t, func(o *Options) { o.RateLimitPerMin = 100; o.RateLimitUserPerMin = 2; o.TrustProxyHeaders = true })
+	bad := `{"username":"alice","password":"nope-nope-nope"}`
+	for i := 0; i < 2; i++ {
+		e.do("POST", "/auth/login", bad, "CF-Connecting-IP", "6.6.6.6")
+	}
+	if rec := e.do("POST", "/auth/login", bad, "CF-Connecting-IP", "6.6.6.6"); rec.Code != 429 {
+		t.Fatalf("attacker should be limited: %d", rec.Code)
+	}
+	// The real user, from another IP, is not locked out by the attacker.
+	good := `{"username":"alice","password":"passw0rd-long"}`
+	if rec := e.do("POST", "/auth/login", good, "CF-Connecting-IP", "7.7.7.7"); rec.Code != 200 {
+		t.Fatalf("victim locked out: %d", rec.Code)
+	}
+}
+
+func TestDistributedGuessingHitsGlobalUsernameCeiling(t *testing.T) {
+	e := newEnv(t, func(o *Options) { o.RateLimitPerMin = 1000; o.RateLimitUserPerMin = 1; o.TrustProxyHeaders = true })
+	bad := `{"username":"alice","password":"nope-nope-nope"}`
+	var last int
+	for i := 0; i < globalUserLimitFactor+1; i++ {
+		last = e.do("POST", "/auth/login", bad, "CF-Connecting-IP", "9.9.9."+strconv.Itoa(i+1)).Code
+	}
+	if last != 429 {
+		t.Fatalf("expected global per-username ceiling, got %d", last)
+	}
+}
+
+func TestClientIPNormalisation(t *testing.T) {
+	h := &authHandler{trustProxy: true}
+	for in, want := range map[string]string{
+		"1.2.3.4":          "1.2.3.4",
+		" 1.2.3.4 ":        "1.2.3.4",
+		"::ffff:1.2.3.4":   "1.2.3.4",
+		"fe80::1%eth0":     "fe80::1",
+		"not-an-ip":        "10.0.0.1",
+		"1.2.3.4, 5.6.7.8": "10.0.0.1",
+	} {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = "10.0.0.1:99"
+		r.Header.Set("CF-Connecting-IP", in)
+		if got := h.clientIP(r); got != want {
+			t.Errorf("%q -> %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestLimiterKeyBoundsLongUsernames(t *testing.T) {
+	if k := limiterKey(strings.Repeat("a", 100000)); len(k) > 80 {
+		t.Fatalf("key too long: %d", len(k))
+	}
+	if limiterKey("alice") != "alice" {
+		t.Fatal("short keys unchanged")
 	}
 }

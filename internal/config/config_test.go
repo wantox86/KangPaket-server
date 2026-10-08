@@ -23,7 +23,7 @@ func TestLoadDefaults(t *testing.T) {
 }
 
 func TestLoadRejectsBadJWTSecret(t *testing.T) {
-	for _, s := range []string{"", "short"} {
+	for _, s := range []string{"", "short", "change-me-to-a-long-random-string-xxxxxxxx"} {
 		setValid(t)
 		t.Setenv("JWT_SECRET", s)
 		if _, err := Load(); err == nil {

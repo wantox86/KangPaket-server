@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/netip"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/wantox86/KangPaket-server/internal/auth"
@@ -17,13 +18,19 @@ import (
 
 const maxBodyBytes = 1 << 20
 
+// globalUserLimitFactor sizes the per-username limiter that counts attempts from
+// every IP. Locking someone out therefore needs this many times the per-IP
+// budget, which a single client cannot reach (its own IP limiter trips first).
+const globalUserLimitFactor = 10
+
 type authHandler struct {
 	svc          *auth.Service
 	log          *slog.Logger
 	registration bool
 	trustProxy   bool
-	ipLogin      *auth.Limiter
-	userLogin    *auth.Limiter
+	ipLogin      *auth.Limiter // per client IP
+	userLogin    *auth.Limiter // per IP+username: lockout is scoped to the attacker's IP
+	nameLogin    *auth.Limiter // per username across all IPs: high ceiling vs distributed guessing
 	ipRefresh    *auth.Limiter
 	ipRegister   *auth.Limiter
 }
@@ -33,12 +40,14 @@ func newAuthHandler(o Options) *authHandler {
 	h := &authHandler{
 		svc: o.Auth, log: o.Log, registration: o.RegistrationEnabled, trustProxy: o.TrustProxyHeaders,
 		ipLogin: mk(o.RateLimitPerMin), userLogin: mk(o.RateLimitUserPerMin),
+		nameLogin: mk(o.RateLimitUserPerMin * globalUserLimitFactor),
 		ipRefresh: mk(o.RateLimitPerMin), ipRegister: mk(o.RateLimitPerMin),
 	}
 	go func() {
 		for range time.Tick(time.Minute) {
 			h.ipLogin.Cleanup()
 			h.userLogin.Cleanup()
+			h.nameLogin.Cleanup()
 			h.ipRefresh.Cleanup()
 			h.ipRegister.Cleanup()
 		}
@@ -71,8 +80,10 @@ type sessionJSON struct {
 
 func (h *authHandler) clientIP(r *http.Request) string {
 	if h.trustProxy {
-		if a, err := netip.ParseAddr(r.Header.Get("CF-Connecting-IP")); err == nil {
-			return a.String()
+		// Only a literal IP is accepted; zones and IPv4-mapped forms are normalised
+		// so one client cannot mint many limiter keys.
+		if a, err := netip.ParseAddr(strings.TrimSpace(r.Header.Get("CF-Connecting-IP"))); err == nil {
+			return a.WithZone("").Unmap().String()
 		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -106,6 +117,15 @@ func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	return true
 }
 
+// limiterKey bounds limiter map keys: usernames can be up to the 1 MiB body size.
+func limiterKey(name string) string {
+	if len(name) > 64 {
+		sum := sha256.Sum256([]byte(name))
+		return "h:" + hex.EncodeToString(sum[:])
+	}
+	return name
+}
+
 // shortHash lets logs correlate attempts without recording the username.
 func shortHash(s string) string {
 	sum := sha256.Sum256([]byte(s))
@@ -125,7 +145,8 @@ func (h *authHandler) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := auth.NormalizeUsername(req.Username)
-	if !h.limit(w, h.userLogin, name) {
+	key := limiterKey(name)
+	if !h.limit(w, h.userLogin, ip+"|"+key) || !h.limit(w, h.nameLogin, key) {
 		return
 	}
 	s, err := h.svc.Login(r.Context(), name, req.Password, r.UserAgent())

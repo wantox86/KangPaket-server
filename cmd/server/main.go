@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -22,13 +23,15 @@ import (
 
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	var err error
 	if len(os.Args) > 1 {
-		err = runCLI(os.Args[1], os.Args[2:])
-	} else {
-		err = run(log)
+		// CLI errors are plain text on stderr, not structured logs.
+		if err := runCLI(os.Args[1], os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
 	}
-	if err != nil {
+	if err := run(log); err != nil {
 		log.Error("fatal", "err", err)
 		os.Exit(1)
 	}
@@ -104,6 +107,7 @@ func run(log *slog.Logger) error {
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    64 << 10,
 	}
 
 	errCh := make(chan error, 1)

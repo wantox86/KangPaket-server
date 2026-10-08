@@ -89,6 +89,9 @@ func (c *Config) validate() error {
 	if len(c.JWTSecret) < minJWTSecretLen {
 		return fmt.Errorf("JWT_SECRET is required and must be at least %d characters", minJWTSecretLen)
 	}
+	if strings.HasPrefix(strings.ToLower(c.JWTSecret), "change-me") {
+		return errors.New("JWT_SECRET is still the placeholder value; generate a random one")
+	}
 	if c.AccessTokenTTL <= 0 || c.RefreshTokenTTL <= 0 {
 		return errors.New("ACCESS_TOKEN_TTL and REFRESH_TOKEN_TTL must be positive")
 	}
