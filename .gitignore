@@ -1,0 +1,13 @@
+# Local agent instructions (never commit)
+CLAUDE.md
+
+# Secrets / local config (repo is public)
+.env
+.env.*
+!.env.example
+
+# Build output
+bin/
+*.exe
+
+.DS_Store
