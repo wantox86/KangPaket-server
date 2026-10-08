@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/wantox86/KangPaket-server/internal/auth"
+	"github.com/wantox86/KangPaket-server/internal/syncstore"
 )
 
 type Pinger interface {
@@ -20,6 +21,7 @@ type Options struct {
 	DB                  Pinger
 	Log                 *slog.Logger
 	Auth                *auth.Service
+	Sync                syncstore.Store // nil disables /sync routes
 	RegistrationEnabled bool
 	TrustProxyHeaders   bool
 	CORSAllowedOrigins  []string
@@ -42,6 +44,9 @@ func NewRouter(o Options) http.Handler {
 	})
 	if o.Auth != nil {
 		newAuthHandler(o).routes(mux)
+		if o.Sync != nil {
+			newSyncHandler(o).routes(mux)
+		}
 	}
 	return securityHeaders(cors(o.CORSAllowedOrigins, logRequests(mux, log)))
 }

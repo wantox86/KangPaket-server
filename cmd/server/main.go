@@ -16,6 +16,7 @@ import (
 	"github.com/wantox86/KangPaket-server/internal/db"
 	"github.com/wantox86/KangPaket-server/internal/httpapi"
 	"github.com/wantox86/KangPaket-server/internal/migrate"
+	"github.com/wantox86/KangPaket-server/internal/syncstore"
 	"github.com/wantox86/KangPaket-server/migrations"
 )
 
@@ -92,6 +93,7 @@ func run(log *slog.Logger) error {
 			DB:                  conn,
 			Log:                 log,
 			Auth:                svc,
+			Sync:                syncstore.NewMySQLStore(conn),
 			RegistrationEnabled: cfg.RegistrationEnabled,
 			TrustProxyHeaders:   cfg.TrustProxyHeaders,
 			CORSAllowedOrigins:  cfg.CORSAllowedOrigins,
