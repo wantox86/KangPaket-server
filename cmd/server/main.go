@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/wantox86/KangPaket-server/internal/auth"
 	"github.com/wantox86/KangPaket-server/internal/config"
 	"github.com/wantox86/KangPaket-server/internal/db"
 	"github.com/wantox86/KangPaket-server/internal/httpapi"
@@ -19,9 +21,43 @@ import (
 
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	if err := run(log); err != nil {
+	var err error
+	if len(os.Args) > 1 {
+		err = runCLI(os.Args[1], os.Args[2:])
+	} else {
+		err = run(log)
+	}
+	if err != nil {
 		log.Error("fatal", "err", err)
 		os.Exit(1)
+	}
+}
+
+func newAuthService(cfg *config.Config, conn *sql.DB, log *slog.Logger) (*auth.Service, error) {
+	hasher, err := auth.DefaultHasher()
+	if err != nil {
+		return nil, err
+	}
+	return &auth.Service{
+		Store:      auth.NewMySQLStore(conn),
+		Hasher:     hasher,
+		Secret:     []byte(cfg.JWTSecret),
+		AccessTTL:  cfg.AccessTokenTTL,
+		RefreshTTL: cfg.RefreshTokenTTL,
+		Log:        log,
+	}, nil
+}
+
+func purgeExpired(ctx context.Context, store auth.Store) {
+	t := time.NewTicker(time.Hour)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			store.PurgeExpired(ctx, time.Now().Add(-7*24*time.Hour))
+		}
 	}
 }
 
@@ -44,9 +80,24 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
+	svc, err := newAuthService(cfg, conn, log)
+	if err != nil {
+		return err
+	}
+	go purgeExpired(ctx, svc.Store)
+
 	srv := &http.Server{
-		Addr:              ":" + cfg.Port,
-		Handler:           httpapi.NewRouter(conn, log),
+		Addr: ":" + cfg.Port,
+		Handler: httpapi.NewRouter(httpapi.Options{
+			DB:                  conn,
+			Log:                 log,
+			Auth:                svc,
+			RegistrationEnabled: cfg.RegistrationEnabled,
+			TrustProxyHeaders:   cfg.TrustProxyHeaders,
+			CORSAllowedOrigins:  cfg.CORSAllowedOrigins,
+			RateLimitPerMin:     cfg.RateLimitPerMin,
+			RateLimitUserPerMin: cfg.RateLimitUserPerMin,
+		}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
