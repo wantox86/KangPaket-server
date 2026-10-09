@@ -2,7 +2,7 @@
 
 Cloud sync backend for the KangPaket desktop app. Go + MySQL.
 
-Phase 1: config, `/healthz`, auto-migrations, Docker. Phase 2: authentication. Phase 3: Sync API. Phase 4: hardening + deploy (this state).
+Included: config, `/healthz`, auto-migrations, Docker, authentication, Sync API, hardening and homelab deployment (v1.1.0). The matching client is [KangPaket](https://github.com/wantox86/KangPaket) (Tools > Akun Cloud Sync).
 
 ## Run
 
@@ -137,12 +137,16 @@ positive unix ms (`invalid_client_updated_at`), payload must be a JSON object (`
 
 ### Recommended client flow
 
-First login on a device (two-way merge): `pull` from `since=0` until `has_more` is false and merge
-into local data (per `id`, keep the record with the larger `client_updated_at`; tombstones delete);
-then `push` every local record that is newer than, or missing from, the server copy; handle
-`conflict` results by adopting `server`; then `pull` again from the stored cursor and save the
-returned `cursor`. Afterwards sync = `push` local changes (with deletes as tombstones, batches of
-<= 500) then `pull` from the stored cursor. Refresh the access token (15 min) on 401.
+Every cycle (the KangPaket client does exactly this; the first login is the same cycle with
+`since=0`, which makes it a two-way merge): `pull` from the stored cursor until `has_more` is false
+and merge into local data (per `id`, keep the record with the larger `client_updated_at`;
+tombstones delete); save the returned `cursor`; then `push` every local record that is newer than,
+or missing from, the server copy, plus local deletes as tombstones (batches of <= 500); adopt the
+`server` copy of every `conflict` result. Refresh the access token (15 min) on 401.
+
+The server does not know which device a request comes from. Clients that log out and then log in
+as a *different* user keep their local data; the client decides whether that data is merged into
+the new account (the KangPaket client currently does merge it, see its README).
 
 ## Deployment (homelab)
 
@@ -169,6 +173,9 @@ returned `cursor`. Afterwards sync = `push` local changes (with deletes as tombs
 
 ## Security notes
 
+- **Payloads are stored in plaintext**, including profile auth fields (bearer tokens, basic-auth
+  passwords, API keys) and secret environment variables. They are protected by TLS in transit
+  and by access to the database only, and therefore also appear in the daily database dumps.
 - All SQL is parameterised; table names come from a fixed map. Every sync query is keyed by `user_id`.
 - JWT: HS256 only (algorithm pinned), issuer + `exp` required, user re-checked in the DB on each
   request (disabled/deleted users lose access immediately). Access tokens stay valid until they
@@ -190,7 +197,7 @@ returned `cursor`. Afterwards sync = `push` local changes (with deletes as tombs
 
 SQL files in `migrations/` are embedded in the binary and applied in filename
 order at startup; applied versions are tracked in `schema_migrations`. Add new
-changes as new files (`0002_*.sql`); never edit applied ones.
+changes as new files (next is `0004_*.sql`); never edit applied ones.
 
 ## Test
 
