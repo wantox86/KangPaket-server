@@ -252,3 +252,66 @@ func TestLimiter(t *testing.T) {
 		t.Fatalf("cleanup left %d keys", l.Len())
 	}
 }
+
+func TestLimiterMaxKeys(t *testing.T) {
+	l := auth.NewLimiterWithMaxKeys(2, time.Minute, 3)
+	now := time.Now()
+	l.SetClock(func() time.Time { return now })
+
+	// Fill capacity: k1 at t=0, k2 & k3 at t=30s.
+	if ok, _ := l.Allow("k1"); !ok {
+		t.Fatal("k1 denied")
+	}
+	now = now.Add(30 * time.Second)
+	if ok, _ := l.Allow("k2"); !ok {
+		t.Fatal("k2 denied")
+	}
+	if ok, _ := l.Allow("k3"); !ok {
+		t.Fatal("k3 denied")
+	}
+	if l.Len() != 3 {
+		t.Fatalf("len=%d, want 3", l.Len())
+	}
+
+	// Advance so only k1 is expired; inserting k4 must drop k1 first and keep k2, k3.
+	now = now.Add(31 * time.Second)
+	if ok, _ := l.Allow("k4"); !ok {
+		t.Fatal("k4 denied")
+	}
+	if l.Len() != 3 {
+		t.Fatalf("len=%d after expired eviction, want 3", l.Len())
+	}
+
+	// Exhaust k2 so it becomes blocked (still oldest active key).
+	if ok, _ := l.Allow("k2"); !ok {
+		t.Fatal("k2 2nd attempt denied")
+	}
+	if ok, _ := l.Allow("k2"); ok {
+		t.Fatal("k2 should be blocked")
+	}
+	// Advance slightly and insert k5: k3 (oldest non-blocked) should be evicted rather than blocked k2.
+	now = now.Add(time.Second)
+	if ok, _ := l.Allow("k5"); !ok {
+		t.Fatal("k5 denied")
+	}
+	if l.Len() != 3 {
+		t.Fatalf("len=%d after non-blocked eviction, want 3", l.Len())
+	}
+	if ok, _ := l.Allow("k2"); ok {
+		t.Fatal("blocked k2 should not have been evicted while non-blocked keys existed")
+	}
+
+	// Block the remaining keys (k4, k5) too, then insert k6: new key still admitted and cap enforced.
+	if ok, _ := l.Allow("k4"); !ok {
+		t.Fatal("k4 2nd attempt denied")
+	}
+	if ok, _ := l.Allow("k5"); !ok {
+		t.Fatal("k5 2nd attempt denied")
+	}
+	if ok, _ := l.Allow("k6"); !ok {
+		t.Fatal("k6 denied when all existing keys blocked")
+	}
+	if l.Len() > 3 {
+		t.Fatalf("len=%d exceeds maxKeys=3", l.Len())
+	}
+}
