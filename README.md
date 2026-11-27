@@ -51,7 +51,7 @@ JSON API, errors are `{"error":"<code>"}`.
 
 - Passwords: argon2id (m=32MiB, t=3, p=2), minimum 10 characters. Usernames: 3-32 chars of `a-z 0-9 . _ -`, case-insensitive.
 - Access token: JWT HS256, 15 min. Refresh token: random, stored only as a sha256 hash. Presenting an already-revoked refresh token revokes its whole token family.
-- `/auth/login`, `/auth/refresh`, `/auth/register` are rate limited (429 + `Retry-After`).
+- `/auth/login`, `/auth/refresh`, `/auth/logout`, `/auth/register` are rate limited (429 + `Retry-After`); `/auth/logout` caps request bodies at 4 KiB.
 - Sync handlers wrap routes with `httpapi.RequireAuth` and read the user via `httpapi.UserID(ctx)`.
 
 ### Managing users (CLI)
@@ -182,7 +182,10 @@ the new account (the KangPaket client currently does merge it, see its README).
   expire (15 min) after logout.
 - Refresh tokens: random, stored as sha256, rotated on use, reuse revokes the whole family.
 - Login spends one argon2id verification whether or not the user exists; same 401 either way.
-- Rate limiting is in memory (reset on restart) and cleaned every minute. Login uses three limiters:
+- Rate limiting is in memory (reset on restart) and cleaned every minute. IPv6 client addresses are
+  normalised to `/64` prefixes (IPv4 stays per address; IPv4-mapped IPv6 is unmapped to IPv4), and
+  each limiter caps its map size (default 100,000 keys, evicting expired then least-recently-active
+  keys) to bound memory. Login uses three limiters:
   per IP, per IP+username (so a third party cannot lock your username out from their own IP), and a
   per-username ceiling across all IPs (10x). Tradeoff: a botnet of >= 10 IPs can still force
   429s on one username for a minute; stronger protection needs persistent lockout or CAPTCHA.

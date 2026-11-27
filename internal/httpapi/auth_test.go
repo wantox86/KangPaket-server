@@ -275,19 +275,112 @@ func TestDistributedGuessingHitsGlobalUsernameCeiling(t *testing.T) {
 func TestClientIPNormalisation(t *testing.T) {
 	h := &authHandler{trustProxy: true}
 	for in, want := range map[string]string{
-		"1.2.3.4":          "1.2.3.4",
-		" 1.2.3.4 ":        "1.2.3.4",
-		"::ffff:1.2.3.4":   "1.2.3.4",
-		"fe80::1%eth0":     "fe80::1",
-		"not-an-ip":        "10.0.0.1",
-		"1.2.3.4, 5.6.7.8": "10.0.0.1",
+		"1.2.3.4":                  "1.2.3.4",
+		" 1.2.3.4 ":                "1.2.3.4",
+		"::ffff:1.2.3.4":           "1.2.3.4",
+		"fe80::1%eth0":             "fe80::/64",
+		"2001:db8:1:2::1":          "2001:db8:1:2::/64",
+		"2001:db8:1:2:ffff:0:0:99": "2001:db8:1:2::/64",
+		"2001:db8:1:3::1":          "2001:db8:1:3::/64",
+		"not-an-ip":                "10.0.0.1",
+		"1.2.3.4, 5.6.7.8":         "10.0.0.1",
 	} {
 		r := httptest.NewRequest("GET", "/", nil)
 		r.RemoteAddr = "10.0.0.1:99"
 		r.Header.Set("CF-Connecting-IP", in)
 		if got := h.clientIP(r); got != want {
-			t.Errorf("%q -> %q, want %q", in, got, want)
+			t.Errorf("CF-Connecting-IP %q -> %q, want %q", in, got, want)
 		}
+	}
+
+	// Untrusted proxy ignores CF-Connecting-IP and normalises RemoteAddr (including IPv6 /64 & IPv4-mapped).
+	untrusted := &authHandler{trustProxy: false}
+	for remote, want := range map[string]string{
+		"10.0.0.1:99":                     "10.0.0.1",
+		"[::ffff:10.0.0.2]:99":            "10.0.0.2",
+		"[2001:db8:a:b::1]:443":           "2001:db8:a:b::/64",
+		"[2001:db8:a:b:dead:beef::2]:443": "2001:db8:a:b::/64",
+		"[fe80::1%eth0]:443":              "fe80::/64",
+	} {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = remote
+		r.Header.Set("CF-Connecting-IP", "9.9.9.9")
+		if got := untrusted.clientIP(r); got != want {
+			t.Errorf("RemoteAddr %q -> %q, want %q", remote, got, want)
+		}
+	}
+}
+
+func TestIPv6PrefixRateLimit(t *testing.T) {
+	bad := `{"username":"alice","password":"nope-nope-nope"}`
+
+	// Trusted proxy: different host IDs in the same /64 share a bucket; another /64 is separate.
+	e := newEnv(t, func(o *Options) { o.RateLimitPerMin = 2; o.RateLimitUserPerMin = 100; o.TrustProxyHeaders = true })
+	for _, ip := range []string{"2001:db8:1:2::1", "2001:db8:1:2::2"} {
+		if rec := e.do("POST", "/auth/login", bad, "CF-Connecting-IP", ip); rec.Code != 401 {
+			t.Fatalf("same /64 %s: got %d", ip, rec.Code)
+		}
+	}
+	if rec := e.do("POST", "/auth/login", bad, "CF-Connecting-IP", "2001:db8:1:2:ffff::3"); rec.Code != 429 {
+		t.Fatalf("3rd host in same /64 should be limited, got %d", rec.Code)
+	}
+	if rec := e.do("POST", "/auth/login", bad, "CF-Connecting-IP", "2001:db8:1:3::1"); rec.Code != 401 {
+		t.Fatalf("different /64 should not be limited, got %d", rec.Code)
+	}
+
+	// IPv4-mapped IPv6 shares bucket with its IPv4 address; another IPv4 is unaffected.
+	if rec := e.do("POST", "/auth/login", bad, "CF-Connecting-IP", "5.5.5.5"); rec.Code != 401 {
+		t.Fatalf("ipv4 1st: %d", rec.Code)
+	}
+	if rec := e.do("POST", "/auth/login", bad, "CF-Connecting-IP", "::ffff:5.5.5.5"); rec.Code != 401 {
+		t.Fatalf("ipv4-mapped 2nd: %d", rec.Code)
+	}
+	if rec := e.do("POST", "/auth/login", bad, "CF-Connecting-IP", "5.5.5.5"); rec.Code != 429 {
+		t.Fatalf("ipv4 + ipv4-mapped should share bucket, got %d", rec.Code)
+	}
+	if rec := e.do("POST", "/auth/login", bad, "CF-Connecting-IP", "5.5.5.6"); rec.Code != 401 {
+		t.Fatalf("different ipv4 should not be limited, got %d", rec.Code)
+	}
+
+	// Untrusted proxy: CF-Connecting-IP ignored; RemoteAddr IPv6 /64 still shares bucket.
+	e2 := newEnv(t, func(o *Options) { o.RateLimitPerMin = 1; o.RateLimitUserPerMin = 100; o.TrustProxyHeaders = false })
+	doRemote := func(remote, cf string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", "/auth/login", strings.NewReader(bad))
+		req.RemoteAddr = remote
+		req.Header.Set("CF-Connecting-IP", cf)
+		rec := httptest.NewRecorder()
+		e2.h.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := doRemote("[2001:db8:9:8::1]:1111", "1.1.1.1"); rec.Code != 401 {
+		t.Fatalf("remote 1st: %d", rec.Code)
+	}
+	if rec := doRemote("[2001:db8:9:8::2]:2222", "2.2.2.2"); rec.Code != 429 {
+		t.Fatalf("same /64 RemoteAddr with untrusted proxy should be limited, got %d", rec.Code)
+	}
+}
+
+func TestLogoutRateLimitAndBodyLimit(t *testing.T) {
+	e := newEnv(t, nil)
+	m := login(t, e)
+	tok := m["refresh_token"].(string)
+
+	// Body over 4 KiB is rejected with 413 payload_too_large.
+	big := `{"refresh_token":"` + strings.Repeat("x", maxLogoutBodyBytes+1) + `"}`
+	if rec := e.do("POST", "/auth/logout", big); rec.Code != http.StatusRequestEntityTooLarge || errCode(t, rec) != "payload_too_large" {
+		t.Fatalf("oversized logout body: %d %s", rec.Code, rec.Body)
+	}
+
+	// Normal logout succeeds (204) up to the per-IP limit, then 429 + Retry-After.
+	// Note: the oversized request above already consumed 1 slot from the same IP.
+	for i := 1; i < logoutRatePerMin; i++ {
+		if rec := e.do("POST", "/auth/logout", `{"refresh_token":"`+tok+`"}`); rec.Code != http.StatusNoContent {
+			t.Fatalf("logout attempt %d: got %d %s", i, rec.Code, rec.Body)
+		}
+	}
+	rec := e.do("POST", "/auth/logout", `{"refresh_token":"`+tok+`"}`)
+	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") == "" || errCode(t, rec) != "rate_limited" {
+		t.Fatalf("expected 429 on logout limit, got %d hdr=%v body=%s", rec.Code, rec.Header(), rec.Body)
 	}
 }
 

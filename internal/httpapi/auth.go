@@ -16,7 +16,11 @@ import (
 	"github.com/wantox86/KangPaket-server/internal/auth"
 )
 
-const maxBodyBytes = 1 << 20
+const (
+	maxBodyBytes       = 1 << 20
+	maxLogoutBodyBytes = 4 << 10
+	logoutRatePerMin   = 30
+)
 
 // globalUserLimitFactor sizes the per-username limiter that counts attempts from
 // every IP. Locking someone out therefore needs this many times the per-IP
@@ -33,6 +37,7 @@ type authHandler struct {
 	nameLogin    *auth.Limiter // per username across all IPs: high ceiling vs distributed guessing
 	ipRefresh    *auth.Limiter
 	ipRegister   *auth.Limiter
+	ipLogout     *auth.Limiter
 }
 
 func newAuthHandler(o Options) *authHandler {
@@ -42,6 +47,7 @@ func newAuthHandler(o Options) *authHandler {
 		ipLogin: mk(o.RateLimitPerMin), userLogin: mk(o.RateLimitUserPerMin),
 		nameLogin: mk(o.RateLimitUserPerMin * globalUserLimitFactor),
 		ipRefresh: mk(o.RateLimitPerMin), ipRegister: mk(o.RateLimitPerMin),
+		ipLogout: mk(logoutRatePerMin),
 	}
 	go func() {
 		for range time.Tick(time.Minute) {
@@ -50,6 +56,7 @@ func newAuthHandler(o Options) *authHandler {
 			h.nameLogin.Cleanup()
 			h.ipRefresh.Cleanup()
 			h.ipRegister.Cleanup()
+			h.ipLogout.Cleanup()
 		}
 	}()
 	return h
@@ -78,17 +85,31 @@ type sessionJSON struct {
 	User         userJSON `json:"user"`
 }
 
+// normalizeIP strips zones, unmaps IPv4-mapped IPv6 addresses to IPv4, and
+// masks IPv6 addresses to /64 so a client rotating host IDs inside one /64
+// shares a single limiter bucket.
+func normalizeIP(a netip.Addr) string {
+	a = a.WithZone("").Unmap()
+	if a.Is6() {
+		return netip.PrefixFrom(a, 64).Masked().String()
+	}
+	return a.String()
+}
+
 func (h *authHandler) clientIP(r *http.Request) string {
 	if h.trustProxy {
-		// Only a literal IP is accepted; zones and IPv4-mapped forms are normalised
-		// so one client cannot mint many limiter keys.
+		// Only a literal IP is accepted; zones, IPv4-mapped forms and IPv6 /64s
+		// are normalised so one client cannot mint many limiter keys.
 		if a, err := netip.ParseAddr(strings.TrimSpace(r.Header.Get("CF-Connecting-IP"))); err == nil {
-			return a.WithZone("").Unmap().String()
+			return normalizeIP(a)
 		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
+	}
+	if a, err := netip.ParseAddr(strings.TrimSpace(host)); err == nil {
+		return normalizeIP(a)
 	}
 	return host
 }
@@ -104,7 +125,11 @@ func (h *authHandler) limit(w http.ResponseWriter, l *auth.Limiter, key string) 
 }
 
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	return decodeLimit(w, r, v, maxBodyBytes)
+}
+
+func decodeLimit(w http.ResponseWriter, r *http.Request, v any, maxBytes int64) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
@@ -196,8 +221,11 @@ func (h *authHandler) refresh(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *authHandler) logout(w http.ResponseWriter, r *http.Request) {
+	if !h.limit(w, h.ipLogout, h.clientIP(r)) {
+		return
+	}
 	var req refreshReq
-	if !decode(w, r, &req) {
+	if !decodeLimit(w, r, &req, maxLogoutBodyBytes) {
 		return
 	}
 	if err := h.svc.Logout(r.Context(), req.RefreshToken); err != nil {
