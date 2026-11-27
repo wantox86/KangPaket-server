@@ -309,6 +309,16 @@ func TestClientIPNormalisation(t *testing.T) {
 			t.Errorf("RemoteAddr %q -> %q, want %q", remote, got, want)
 		}
 	}
+
+	// Unparseable or empty peer addresses map to one fixed sentinel key, never to
+	// the raw (possibly empty) string.
+	for _, remote := range []string{"", "garbage", "not-an-ip:99", "@"} {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.RemoteAddr = remote
+		if got := untrusted.clientIP(r); got != "unknown" {
+			t.Errorf("RemoteAddr %q -> %q, want %q", remote, got, "unknown")
+		}
+	}
 }
 
 func TestIPv6PrefixRateLimit(t *testing.T) {

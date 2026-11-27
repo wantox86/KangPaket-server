@@ -111,7 +111,9 @@ func (h *authHandler) clientIP(r *http.Request) string {
 	if a, err := netip.ParseAddr(strings.TrimSpace(host)); err == nil {
 		return normalizeIP(a)
 	}
-	return host
+	// Unparseable/empty peer address: use a fixed sentinel rather than an
+	// attacker-influenced or empty string that could mint arbitrary limiter keys.
+	return "unknown"
 }
 
 func (h *authHandler) limit(w http.ResponseWriter, l *auth.Limiter, key string) bool {
